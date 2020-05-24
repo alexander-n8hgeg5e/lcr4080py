@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 
 from serial import Serial
-from sys import exit
+from sys import exit,stderr,stdout
 from time import sleep
 from os import set_blocking
 from types import FunctionType
 from pprint import pprint
 from re import match
 from pint import UnitRegistry
+from math import inf
 
 ur=UnitRegistry()
 Ohm=ur.ohm
@@ -32,7 +33,7 @@ data_translation = [
             'S': ('PAL/SER', 'SER'),
             '_': ('PAL/SER', '_' )},
         { 'A': ('range_sel','auto'),
-          'S': ('range_sel','manual')},
+          'M': ('range_sel','manual')},
         { '0' : (('LCR-value-state', 'LCR-value-0' ),('ok'      , lambda x : x )),
           '1' : (('LCR-value-state', 'LCR-value-0' ),('ok'      , lambda x : x )),
           '8' : (('LCR-value-state', 'LCR-value-0' ),('ch-range', None )),
@@ -155,6 +156,19 @@ range_translations = {
                                         'R' : [ud(k,j) for j,k in zip(range_translation_2nd_Rs,range_translation_2nd_R)],
                                         },
                      }
+
+tolerances_R =  [ # format := ( percentage , add fixed value )
+                (0.012 , 8 * 1e-3*Ohm),
+                (0.008 , 5 * 1e-2*Ohm),
+                (0.005 , 3 * 1e-1*Ohm),
+                (0.005 , 3 * 1e+0*Ohm),
+                (0.005 , 3 * 1e+1*Ohm),
+                (0.005 , 5 * 1e+2*Ohm),
+                (0.020 , 8 * 1e+3*Ohm),
+                ]
+
+tolerances = { "R" : tolerances_R }
+
 def combine(d,key):
     s=d
     lk=len(key)
@@ -371,11 +385,186 @@ def print_data(data):
     for k in pk:
         print("{:>20} = {}".format(k,data[k]))
 
+def get_data(print_data=False):
+    return process_data_further(read_data(print_data=print_data))
+
+def main_setup(lcr="[lcr]",qdr="[qdr]", freq='120|1k',serpal='s|p',sel_range='auto|[0-6]'):
+    """
+    The defaults are regexes that will not change the setting.
+    The possible options are described in the regexes.
+    To change an option, set a value that the regex would match.
+    Unset values are obtained from the lcr-meter and send but are not changed.
+    """
+    defaults=   {
+                'lcr':'[lcr]',
+                'qdr':'[qdr]',
+                'freq':'120|1k',
+                'serpal':'s|p',
+                'sel_range':'auto|[0-6]',
+                }
+    current_values=get_data()
+    current_values.update({ 'serpal': current_values["PAL/SER"][0] })
+    current_values.update({ 'sel_range':current_values["range_sel"]})
+    current_values.update({ 'qdr':current_values["QDR"]})
+    current_values.update({ 'lcr':current_values["LCR"]})
+    setup_values={}
+    for k,v in defaults.items():
+        if locals()[k] != v:
+            # changed
+            setup_values.update({k:locals()[k]})
+        else:
+            setup_values.update({k:current_values[k]})
+    #print(setup_values)
+    sv=setup_values
+    cmdstr="[E"+(sv['lcr']+sv['qdr']+sv['serpal']+('A' if (sv['freq'] in [ "1k", 1*kHz]) else ('B' if (sv['freq'] in[120*Hz,'120']) else ''))).upper()
+    cmdstr+= ("A" if sv['sel_range'] == "auto" else "M")
+    if cmdstr[-1] == 'M':
+        cmdstr+=str(int(sv['sel_range']))
+    else:
+        cmdstr+="0"
+    cmdstr+="]"
+    send_command(cmdstr)
+
+def send_command(data):
+    if type(data) is str:
+        data=data.encode()
+    enter_setup()
+    s.write(data)
+    s.flush()
+    print(get_reply())
+    exit_setup()
+
+def default_setup(code,val):
+    cmdstr='['
+    cmdstr+=code
+    cmdstr+=str(val)
+    cmdstr+=']'
+    send_command(cmdstr)
+
+def set_relative(val):
+    if not type(val) is float:
+        val=float(val)
+    val="{:04.0f}".format(val)
+    default_setup("U? ",val)
+
+def get_val1(blocking=False):
+    while True:
+        data=get_data()
+        if data['LCR-value-state'] == 'ok':
+            seq=int(data['sequence'])
+            stderr.flush()
+            return data['LCR-value'],data['LCR-value-range-index'],seq
+        elif not blocking:
+            return None,None,None
+
+def remove_indexes(indexes,thing):
+    _thing=thing
+    thing=[]
+    for i in range(len(_thing)):
+        if not i in indexes:
+            thing.append(_thing[i])
+    return thing
+
+def is_seq_continous(p,n):
+    if p==9:
+        return  n == 0 
+    else:
+        return n == p+1
+
+def are_continuous(seq):
+    if len(seq) in [0,1]:
+        return False
+    for i in range(len(seq)-1):
+        if not is_seq_continous(seq[i],seq[i+1]):
+            return False
+    return True
+
+def get_val(samples=3,mode="R",last_seq=None,verbose=False):
+    VERBOSE=verbose
+    MAXTRY=inf
+    PRECISION='tol'
+    SAMPLESLEEP=0
+    fails=0
+    avgval=None
+    vals=[]
+    need_newline_stdout=False
+    need_newline_stderr=False
+    while fails <= MAXTRY and len(vals) < samples:
+        val,range_index,seq=get_val1()
+        if val is None:
+            print('.',end="",file=stderr)
+            stderr.flush()
+            need_newline=True
+            fails+=1
+        else:
+            vals.append((val,range_index,seq))
+            print('o',end="",file=stderr)
+            need_newline=True
+            stderr.flush()
+        # calc avgtemp befor loop exit
+        if len(vals) > 0:
+            _vals=[v[0] for v in vals]
+            avgval=sum(_vals)/len(vals)
+            # do check befor continue
+            upper_index=len(vals)-1
+            poplist=[]
+            for ti in range(upper_index+1):
+                if not ti <= upper_index:
+                    break
+                delta = vals[ti][0] - avgval
+                delta = abs(delta)
+                if PRECISION == 'tol':
+                    # use tolerances
+                    tol=tolerances[mode]
+                    precision  = vals[ti][0]*tol[vals[ti][1]][0]
+                    precision += tol[vals[ti][1]][1]
+                else:
+                    precision = PRECISION
+                if delta > precision:
+                    poplist.append(ti)
+                    if VERBOSE:
+                        nl='\n' if need_newline_stderr else ''
+                        print(nl+'Discarded unstable measurement: '+str(vals[ti][0]),file=stderr)
+                        need_newline_stderr=False
+                    else:
+                        print("X",end='')
+                        need_newline_stderr=True
+                    fails+=1
+            vals=remove_indexes(poplist,vals)
+            if last_seq is None:
+                seqences=[-2]
+            else:
+                seqences=[last_seq]
+            seqences+= [v[2] for v in vals]
+            if are_continuous(seqences):
+                last_seq=vals[-1][-1]
+                vals=[]
+                if VERBOSE:
+                    nl='\n' if need_newline_stdout else ''
+                    print(nl+"dropping vals because of continous sequence")
+                    need_newline_stdout=False
+                else:
+                    print("x",end='')
+                    stdout.flush()
+                    need_newline_stdout=True
+        sleep(SAMPLESLEEP)
+    print(file=stderr)
+    return avgval,vals[-1][-1]
+
+def scan_values(filepath):
+    last_seq_num = None
+    while True:
+        f=open(filepath,"at")
+        try:
+            val,last_seq_num=get_val(samples=2,last_seq=last_seq_num)
+            print(val)
+            f.write(str(val)+"\n")
+        finally:
+            f.close()
+        
+    
+
 if __name__ == '__main__':
-    #print(help(Serial))
-    #print(read_data())
-    data=read_data(print_data=False)
-    #pprint(data)
-    data=process_data_further(data)
-    print_data(data)
+    scan_values("/tmp/values_outp")
+    
 # vim: set foldlevel=0 :
