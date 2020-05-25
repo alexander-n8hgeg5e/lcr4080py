@@ -6,9 +6,11 @@ from time import sleep
 from os import set_blocking
 from types import FunctionType
 from pprint import pprint
-from re import match
+from re import match,sub
 from pint import UnitRegistry
 from math import inf
+from pylib.electronic.resistor_utils import resistor_string_to_float
+
 
 ur=UnitRegistry()
 Ohm=ur.ohm
@@ -23,6 +25,7 @@ uF=ur.microfarad
 nF=ur.nanofarad
 pF=ur.picofarad
 fF=ur.femtofarad
+diml=ur.dimensionless
 
 data_translation = [
         ('LCR', lambda x:x),
@@ -186,10 +189,16 @@ def combine(d,key):
                 parts[int(k[lk])] = v
                 keys2remove.append(k)
     try:
-        if not s[key+"state"] == 'ok':
+        k=key+"state"
+        if k in s.keys() and not s[key + "state"] == 'ok':
             value = s[key+"state"]
         else:
-            value = int(''.join(parts))
+            try:
+                s_value=''.join(parts)
+                value = int(s_value)
+            except ValueError:
+                if s_value == '':
+                    value=None
     except TypeError:
         if not None in parts:
             raise
@@ -233,7 +242,9 @@ def decode_data(data):
     return s
 
 def process_data_further(data):
-
+    if not hasattr(data,'keys'):
+        return None
+        raise Exception("ERROR: Could not find LCR-value-state, probably the device is not turned on or not connected.")
     if data['LCR-value-state'] == "ok":
         ri=int(data["LCR-value-range"])
         lcr = data['LCR']
@@ -271,44 +282,54 @@ def process_data_further(data):
     if data['d-val-state'] == "ok":
         ri=int(data["d-val-range"])
         qdr = data['QDR']
-        rt = range_translations['2nd-value'][qdr][ri]
-        unit = rt[qdr]['unit']
-        _range = rt[qdr]['range']
-        data['d-val']=data['d-val']*unit
-        if qdr == "R":
-            _range=_range.to(unit)
-        data['d-val-range'] = _range
-        data.update({'d-val-range-index': ri })
-        data.update({'d-val-unit':unit})
+        if qdr in 'QDR':
+            rt = range_translations['2nd-value'][qdr][ri]
+            unit = rt[qdr]['unit']
+            _range = rt[qdr]['range']
+            data['d-val']=data['d-val']*unit
+            if qdr == "R":
+                _range=_range.to(unit)
+            data['d-val-range'] = _range
+            data.update({'d-val-range-index': ri })
+            data.update({'d-val-unit':unit})
+        else:
+            data['d-val']= qdr
     else:
         data['d-val']=data['d-val-state']
 
     if data['q-val-state'] == "ok":
         ri=int(data["q-val-range"])
         qdr = data['QDR']
-        rt = range_translations['2nd-value'][qdr][ri]
-        unit = rt[qdr]['unit']
-        _range = rt[qdr]['range']
-        data['q-val']=data['q-val']*unit
-        if qdr == "R":
-            _range=_range.to(unit)
-        data['q-val-range'] = _range
-        data.update({'q-val-range-index': ri })
-        data.update({'q-val-unit':unit})
+        if qdr in 'QDR':
+            rt = range_translations['2nd-value'][qdr][ri]
+            unit = rt[qdr]['unit']
+            _range = rt[qdr]['range']
+            data['q-val']=data['q-val']*unit
+            if qdr == "R":
+                _range=_range.to(unit)
+            data['q-val-range'] = _range
+            data.update({'q-val-range-index': ri })
+            data.update({'q-val-unit':unit})
+        else:
+            data['q-val']=data['QDR']
     else:
         data['q-val']=data['q-val-state']
 
     return data
 
-serial_kwargs = {
-                'baudrate' : 1200,
-                'bytesize' : 7,
-                'parity'   : 'E',
-                'stopbits'  : 1,
-                'port'     : '/dev/ttyUSB0',
-                'timeout'  : 1
-              }
-s = Serial(**serial_kwargs)
+def init_serial():
+    serial_kwargs = {
+                    'baudrate' : 1200,
+                    'bytesize' : 7,
+                    'parity'   : 'E',
+                    'stopbits'  : 1,
+                    'port'     : '/dev/ttyUSB0',
+                    'timeout'  : 1
+                  }
+    global s
+    global serial
+    s = Serial(**serial_kwargs)
+    serial=s
 
 def get_reply(decode=True,print_data=False):
     data = s.readall()
@@ -322,6 +343,9 @@ def read_data(print_data=True):
     s.write(b'N')
     s.flush()
     data=get_reply(print_data=print_data)
+    if data.strip() == "":
+        return None
+        raise Exception("ERROR: Could not get any data, probably the device is not turned on or not connected.")
     return decode_data(data)
 
 def exit_setup(print_data=True):
@@ -450,9 +474,8 @@ def set_relative(val):
 def get_val1(blocking=False):
     while True:
         data=get_data()
-        if data['LCR-value-state'] == 'ok':
+        if not data is None and data['LCR-value-state'] == 'ok':
             seq=int(data['sequence'])
-            stderr.flush()
             return data['LCR-value'],data['LCR-value-range-index'],seq
         elif not blocking:
             return None,None,None
@@ -464,6 +487,30 @@ def remove_indexes(indexes,thing):
         if not i in indexes:
             thing.append(_thing[i])
     return thing
+
+def readfile2list(filepath):
+    with open(filepath) as f:
+        data=f.read()
+    try:
+        data=data.strip()
+        if data[0]=='[' and data[-1] != ']':
+            data+='\n]'
+            print("appended \"\n]\"")
+        l=eval(data)
+    except SyntaxError:
+        l=[]
+        lines=data.split("\n")
+        for line in lines:
+            l.append(readline(line))
+    return l
+
+def readline(line):
+    line=line.strip()
+    try:
+        data=eval(line)
+    except SyntaxError:
+        data=float(line)
+    return data
 
 def is_seq_continous(p,n):
     if p==9:
@@ -479,10 +526,10 @@ def are_continuous(seq):
             return False
     return True
 
-def get_val(samples=3,mode="R",last_seq=None,verbose=False):
+def get_val(samples=3,mode="R",last_seq=None,verbose=False,precision='tol',maxtry=inf):
     VERBOSE=verbose
-    MAXTRY=inf
-    PRECISION='tol'
+    MAXTRY=maxtry
+    PRECISION=precision
     SAMPLESLEEP=0
     fails=0
     avgval=None
@@ -492,16 +539,16 @@ def get_val(samples=3,mode="R",last_seq=None,verbose=False):
     while fails <= MAXTRY and len(vals) < samples:
         val,range_index,seq=get_val1()
         if val is None:
-            print('.',end="",file=stderr)
-            stderr.flush()
-            need_newline=True
+            print('.',end="")
+            stdout.flush()
+            need_newline_stdout=True
             fails+=1
         else:
             vals.append((val,range_index,seq))
-            print('o',end="",file=stderr)
-            need_newline=True
-            stderr.flush()
-        # calc avgtemp befor loop exit
+            print('o',end="",file=stdout)
+            need_newline_stdout=True
+            stdout.flush()
+        # calc avgval befor loop exit
         if len(vals) > 0:
             _vals=[v[0] for v in vals]
             avgval=sum(_vals)/len(vals)
@@ -520,6 +567,10 @@ def get_val(samples=3,mode="R",last_seq=None,verbose=False):
                     precision += tol[vals[ti][1]][1]
                 else:
                     precision = PRECISION
+                # add the precision
+                val_ti = vals[ti]
+                vals[ti]=(*val_ti,precision)
+                # check the precision and add to remove/poplist if check fails
                 if delta > precision:
                     poplist.append(ti)
                     if VERBOSE:
@@ -532,12 +583,12 @@ def get_val(samples=3,mode="R",last_seq=None,verbose=False):
                     fails+=1
             vals=remove_indexes(poplist,vals)
             if last_seq is None:
-                seqences=[-2]
+                sequences=[-2]
             else:
-                seqences=[last_seq]
-            seqences+= [v[2] for v in vals]
-            if are_continuous(seqences):
-                last_seq=vals[-1][-1]
+                sequences=[last_seq]
+            sequences+= [v[2] for v in vals]
+            if are_continuous(sequences):
+                last_seq=vals[-1][2]
                 vals=[]
                 if VERBOSE:
                     nl='\n' if need_newline_stdout else ''
@@ -548,23 +599,134 @@ def get_val(samples=3,mode="R",last_seq=None,verbose=False):
                     stdout.flush()
                     need_newline_stdout=True
         sleep(SAMPLESLEEP)
-    print(file=stderr)
-    return avgval,vals[-1][-1]
+    if need_newline_stdout:
+        print()
+    if need_newline_stderr:
+        print(file=stderr)
+
+    # return the worst precision
+    worst_prec=inf*Ohm
+    for v in vals:
+        worst_prec = min(v[-1],worst_prec)
+
+    return avgval,vals[-1][-2],worst_prec
 
 def scan_values(filepath):
     last_seq_num = None
     while True:
         f=open(filepath,"at")
         try:
-            val,last_seq_num=get_val(samples=2,last_seq=last_seq_num)
+            val,last_seq_num,tol=get_val(samples=2,last_seq=last_seq_num)
             print(val)
-            f.write(str(val)+"\n")
+            beep.play()
+            f.write(sub('[ ]ohm','', str(val))+",\n")
         finally:
             f.close()
-        
+
+def init_audio():
+    """
+    """
+    #from pyaudio import PyAudio as pa
+    #global PyAudio
+    #PyAudio=pa
+    print("loading pygame for beep support...")
+    from pygame import mixer
+    mixer.init(frequency=44100,size=8,channels=1)
+    from pygame.mixer import Sound
+    global beep
+    s = b'\x80\x80\x88\x97\x8f\xab\x97\xb9\x9e\xbf\xa5\xbc\xab\xb1\xb1\x9f\xb5\x88\xb9p\xbcZ\xbeJ\xbfA\xbfA\xbeI\xbcY\xbao\xb6\x87\xb1\x9d\xac\xb0'
+    s+= b'\xa5\xbc\x9f\xbf\x97\xba\x90\xac\x88\x98\x80\x81xipUhFa@ZBTMO_JvF\x8eC\xa4A\xb4@\xbe@\xbfA\xb7B\xa7E\x92IzNcSPYC`@gEoRwe'
+    beep=s*100
+    beep=Sound(beep)
+
+def test_audio():
+    init_audio()
+    beep.play()
+
+def l2float(l):
+    return [resistor_string_to_float(i) for i in l]
+
+def calc_range_cross(r0,r1):
+    """
+    How much of r0 is in r1 ?
+    r0:= |>---a---------b----------<|
+    r1:= |>---------c-------d------<|
+    """
+    r0.sort()
+    r1.sort()
+
+    a,b = r0[0],r0[-1]
+    c,d = r1[0],r1[-1]
+
+    full=b-a
     
+    if d<a:
+        return 0
+    elif c <= a and a <= d:
+        start = a
+        case=1
+    elif a<c:
+        start=c
+        case=2
+    if b<c:
+        return 0
+    elif a <= d and d <= b:
+        case+=8
+        end=d
+    elif c<b:
+        case+=4
+        end=b
+    part = end-start
+    return part/full
+
+def find_mode(filepath,min_rx=0.90):
+    last_seq_num = None
+    values = l2float(readfile2list(filepath))
+    while True:
+        val, last_seq_num, abs_error = get_val( samples=1, last_seq=last_seq_num, precision="tol" )
+        for v in values:
+            _v = v * Ohm
+            # assume v was measured with the same absolute error as val
+            range_val=[i*abs_error+val for i in [+1,-1]]
+            range_v=[i*abs_error+_v for i in [+1,-1]]
+            rx=calc_range_cross(range_val,range_v)
+            if  rx >= min_rx:
+                beep.play()
+                sleep(0.3)
+                beep.play()
+                sleep(0.3)
+                beep.play()
+                print("FOUND: M: {} L: {}  rx = {:0.3f}".format(val,_v,rx))
+            beep.play()
+        print("NOTF:, val = {}  ".format(val) ,end='')
+
+def parse_args():
+    global args
+    from argparse import ArgumentParser
+    ap=ArgumentParser()
+    ap.add_argument("-f",'--file',default=None)
+    ap.add_argument("-s","--scan",action="store_true",default=False)
+    ap.add_argument("-b","--beep",action="store_true",default=True)
+    ap.add_argument("--test",action="store_true",default=False)
+    ap.add_argument("-v","--verbose",action="store_true",default=True)
+    args=ap.parse_args()
 
 if __name__ == '__main__':
-    scan_values("/tmp/values_outp")
+    parse_args()
+    if args.test:
+        print('audio test...')
+        test_audio()
+        inp=input("You should have heard a beep, press \"<Enter>\" here to continue.")
+        print("testing done")
+        exit()
+    init_serial()
+    if args.beep:
+        init_audio()
+    if args.scan and not args.file is None:
+        scan_values(args.file)
+    elif not args.scan and not args.file is None:
+        # find mode
+        print("interactive find-value-mode\nprogram emits double beep if value is in declared file ("+args.file+")")
+        find_mode(args.file)
     
 # vim: set foldlevel=0 :
